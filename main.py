@@ -57,7 +57,9 @@ async def callApi(
         "resourceexhausted",
         "overloaded",
         "temporarily overloaded",
-        "too many requests"
+        "too many requests",
+        "rate limit",
+        "rate_limit"
     )
 
     def is_transient(e):
@@ -91,7 +93,7 @@ async def callApi(
             return default_delay
 
         try:
-            return max(0, float(value))
+            return max(0.0, float(value))
         except ValueError:
             pass
 
@@ -105,7 +107,7 @@ async def callApi(
                 retry_date - datetime.now(timezone.utc)
             ).total_seconds()
 
-            return max(0, delay)
+            return max(0.0, delay)
         except (TypeError, ValueError, OverflowError):
             return default_delay
 
@@ -125,13 +127,18 @@ async def callApi(
         )
 
         for attempt in range(max_retries):
+            completion = None
+
             try:
+                request_data = dict(data)
+                request_data["stream"] = True
+
+                existing_extra_body = request_data.pop("extra_body", {}) or {}
+                existing_extra_body.update(extra_body())
+
                 completion = client.chat.completions.create(
-                    model=data.get("model"),
-                    messages=data.get("messages"),
-                    temperature=data.get("temperature"),
-                    stream=True,
-                    extra_body=extra_body(),
+                    **request_data,
+                    extra_body=existing_extra_body,
                 )
 
                 first_chunk = next(completion)
@@ -143,26 +150,63 @@ async def callApi(
             except OpenAIError as e:
                 last_err = e
 
+                status = getattr(e, "status_code", None)
+                response = getattr(e, "response", None)
+
+                print("NVIDIA STATUS:", status)
+                print("NVIDIA BODY:", getattr(e, "body", None))
+
+                if response is not None:
+                    try:
+                        print(
+                            "NVIDIA HEADERS:",
+                            dict(response.headers)
+                        )
+                    except Exception:
+                        pass
+
                 if is_transient(e) and attempt < max_retries - 1:
                     default_delay = base_delay * (2 ** attempt)
-                    retry_after = get_retry_after(e, default_delay)
-                    delay = retry_after + random.uniform(0, 0.5)
+                    retry_after = get_retry_after(
+                        e,
+                        default_delay
+                    )
+
+                    delay = retry_after
+
+                    if retry_after == default_delay:
+                        delay += random.uniform(0.0, 0.5)
+
+                    print(
+                        f"Retrying in {delay:.2f}s "
+                        f"(attempt {attempt + 1}/{max_retries - 1})"
+                    )
 
                     await asyncio.sleep(delay)
                     continue
-
-                status = getattr(e, "status_code", None)
 
                 raise HTTPException(
                     status_code=status or 502,
                     detail=str(getattr(e, "body", e))
                 )
 
+            except Exception as e:
+                raise HTTPException(
+                    status_code=502,
+                    detail=str(e)
+                )
+
         status = getattr(last_err, "status_code", None)
 
         raise HTTPException(
             status_code=status or 502,
-            detail=str(getattr(last_err, "body", last_err))
+            detail=str(
+                getattr(
+                    last_err,
+                    "body",
+                    last_err
+                )
+            )
         )
 
     def completion_generator(first_chunk, completion):
@@ -188,23 +232,49 @@ async def callApi(
                         "reasoning_content",
                         None
                     ) is not None:
+
                         if not is_in_reasnoning:
                             is_in_reasnoning = True
-                            yield 'data: {"choices":[{"delta":{"content":" <think>"}}]}\n\n'
+                            yield (
+                                'data: '
+                                '{"choices":[{"delta":{"content":'
+                                '" <think>"}}]}\n\n'
+                            )
 
                         chunk.choices[0].delta.content = (
                             chunk.choices[0].delta.reasoning_content
                         )
+
                     else:
                         if is_in_reasnoning:
                             is_in_reasnoning = False
-                            yield 'data: {"choices":[{"delta":{"content":" </think>"}}]}\n\n'
+                            yield (
+                                'data: '
+                                '{"choices":[{"delta":{"content":'
+                                '" </think>"}}]}\n\n'
+                            )
 
-                yield "data: " + chunk.model_dump_json() + "\n\n"
+                yield (
+                    "data: "
+                    + chunk.model_dump_json()
+                    + "\n\n"
+                )
 
         except OpenAIError as e:
-            err_msg = str(e.body) if getattr(e, "body", None) else str(e)
-            err_msg = err_msg.replace('"', "'").replace("\n", " ")
+            err_msg = (
+                str(e.body)
+                if getattr(e, "body", None)
+                else str(e)
+            )
+
+            err_msg = (
+                err_msg
+                .replace("\\", "\\\\")
+                .replace('"', '\\"')
+                .replace("\n", " ")
+                .replace("\r", " ")
+            )
+
             yield (
                 'data: {"choices":[{"delta":{"content":"'
                 + "⚠️ Proxy error: "
@@ -213,7 +283,14 @@ async def callApi(
             )
 
         except Exception as e:
-            err_msg = str(e).replace('"', "'").replace("\n", " ")
+            err_msg = (
+                str(e)
+                .replace("\\", "\\\\")
+                .replace('"', '\\"')
+                .replace("\n", " ")
+                .replace("\r", " ")
+            )
+
             yield (
                 'data: {"choices":[{"delta":{"content":"'
                 + "⚠️ Proxy error: "
@@ -232,11 +309,18 @@ async def callApi(
             detail="Invalid or empty JSON request body"
         )
 
+    if not isinstance(data, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="JSON request body must be an object"
+        )
+
     if Authorization is None:
         headers = {
             "Access-Control-Allow-Origin": "https://janitorai.com",
             "Access-Control-Allow-Credentials": "true"
         }
+
         raise HTTPException(
             status_code=401,
             detail="Missing Authorization header",
@@ -260,11 +344,18 @@ async def callApi(
             key
         )
     except HTTPException as e:
-        e.headers = headers
+        if e.headers is None:
+            e.headers = {}
+
+        e.headers.update(headers)
+
         raise e
     else:
         return StreamingResponse(
-            completion_generator(first_chunk, completion),
+            completion_generator(
+                first_chunk,
+                completion
+            ),
             media_type="text/event-stream",
             headers=headers
         )
@@ -282,7 +373,10 @@ async def blank_preflight_handler():
     )
 
 @app.post("/proxy/blank")
-async def returnBlank(request: Request, text: str = "placeholder"):
+async def returnBlank(
+    request: Request,
+    text: str = "placeholder"
+):
     def streaming_generator():
         safe_text = (
             str(text)
@@ -305,6 +399,9 @@ async def returnBlank(request: Request, text: str = "placeholder"):
         media_type="text/event-stream",
         headers={
             "Access-Control-Allow-Origin": "https://janitorai.com",
-            "Access-Control-Allow-Credentials": "true"
+            "Access-Control-Allow-Credentials": "true",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
         }
     )
