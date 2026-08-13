@@ -1,4 +1,7 @@
-import time
+import asyncio
+from email.utils import parsedate_to_datetime
+from datetime import datetime, timezone
+import random
 
 from openai import OpenAI, OpenAIError
 from fastapi import FastAPI, Request, Response, Header, HTTPException
@@ -35,40 +38,90 @@ async def preflight_handler():
     return Response(headers=headers)
 
 @app.post("/proxy")
-async def callApi(request: Request, url: str, reasoning: str = "", reasoning_visibility: str = "", Authorization: str = Header(None)):
+async def callApi(
+    request: Request,
+    url: str,
+    reasoning: str = "",
+    reasoning_visibility: str = "",
+    Authorization: str = Header(None)
+):
     def extra_body():
         if reasoning == "true":
-            return {"chat_template_kwargs": {"thinking":True}}
+            return {"chat_template_kwargs": {"thinking": True}}
         if reasoning == "false":
-            return {"chat_template_kwargs": {"thinking":False}}
+            return {"chat_template_kwargs": {"thinking": False}}
         return {}
 
     TRANSIENT_STATUS = {429, 500, 502, 503, 504, 529}
-    TRANSIENT_MARKERS = ("resourceexhausted", "overloaded", "temporarily overloaded", "too many requests")
+    TRANSIENT_MARKERS = (
+        "resourceexhausted",
+        "overloaded",
+        "temporarily overloaded",
+        "too many requests"
+    )
 
     def is_transient(e):
         msg = str(getattr(e, "body", None) or e).lower()
         status = getattr(e, "status_code", None)
+
         if status in TRANSIENT_STATUS:
             return True
+
         if any(marker in msg for marker in TRANSIENT_MARKERS):
             return True
+
         for code in TRANSIENT_STATUS:
             if f'"code":{code}' in msg or f"'code': {code}" in msg:
                 return True
+
         return False
 
-    def openai_stream_caller(data, url, key, max_retries=3, base_delay=1.5):
+    def get_retry_after(e, default_delay):
+        response = getattr(e, "response", None)
+
+        if response is None:
+            return default_delay
+
+        try:
+            value = response.headers.get("retry-after")
+        except Exception:
+            return default_delay
+
+        if not value:
+            return default_delay
+
+        try:
+            return max(0, float(value))
+        except ValueError:
+            pass
+
+        try:
+            retry_date = parsedate_to_datetime(value)
+
+            if retry_date.tzinfo is None:
+                retry_date = retry_date.replace(tzinfo=timezone.utc)
+
+            delay = (
+                retry_date - datetime.now(timezone.utc)
+            ).total_seconds()
+
+            return max(0, delay)
+        except (TypeError, ValueError, OverflowError):
+            return default_delay
+
+    async def openai_stream_caller(
+        data,
+        url,
+        key,
+        max_retries=3,
+        base_delay=1.5
+    ):
         last_err = None
-        # IMPORTANT: max_retries=0 on the client itself. The OpenAI SDK
-        # retries transient errors (429/5xx) internally by default, which
-        # was silently multiplying every attempt below into several real
-        # outbound requests (retry amplification), burning through
-        # rate-limit windows almost instantly.
+
         client = OpenAI(
-            base_url = url,
-            api_key = key,
-            max_retries = 0
+            base_url=url,
+            api_key=key,
+            max_retries=0
         )
 
         for attempt in range(max_retries):
@@ -77,106 +130,180 @@ async def callApi(request: Request, url: str, reasoning: str = "", reasoning_vis
                     model=data.get("model"),
                     messages=data.get("messages"),
                     temperature=data.get("temperature"),
-                    stream=data.get("stream"),
+                    stream=True,
                     extra_body=extra_body(),
                 )
 
-                # Force the request to actually fire now, so retryable errors
-                # (like overload/rate-limit) surface here instead of mid-stream
                 first_chunk = next(completion)
                 return first_chunk, completion
+
             except StopIteration:
                 return None, completion
+
             except OpenAIError as e:
                 last_err = e
+
                 if is_transient(e) and attempt < max_retries - 1:
-                    time.sleep(base_delay * (attempt + 1))
+                    default_delay = base_delay * (2 ** attempt)
+                    retry_after = get_retry_after(e, default_delay)
+                    delay = retry_after + random.uniform(0, 0.5)
+
+                    await asyncio.sleep(delay)
                     continue
+
                 status = getattr(e, "status_code", None)
-                raise HTTPException(status_code=status or 502, detail=str(getattr(e, "body", e)))
+
+                raise HTTPException(
+                    status_code=status or 502,
+                    detail=str(getattr(e, "body", e))
+                )
 
         status = getattr(last_err, "status_code", None)
-        raise HTTPException(status_code=status or 502, detail=str(getattr(last_err, "body", last_err)))
+
+        raise HTTPException(
+            status_code=status or 502,
+            detail=str(getattr(last_err, "body", last_err))
+        )
 
     def completion_generator(first_chunk, completion):
         is_in_reasnoning = False
+
         try:
             chunks = completion
+
             if first_chunk is not None:
                 def chain():
                     yield first_chunk
                     yield from completion
+
                 chunks = chain()
 
             for chunk in chunks:
                 if not chunk.choices:
                     continue
+
                 if reasoning_visibility == "true":
-                    if getattr(chunk.choices[0].delta, "reasoning_content", None) is not None:
+                    if getattr(
+                        chunk.choices[0].delta,
+                        "reasoning_content",
+                        None
+                    ) is not None:
                         if not is_in_reasnoning:
                             is_in_reasnoning = True
                             yield 'data: {"choices":[{"delta":{"content":" <think>"}}]}\n\n'
-                        chunk.choices[0].delta.content = chunk.choices[0].delta.reasoning_content
+
+                        chunk.choices[0].delta.content = (
+                            chunk.choices[0].delta.reasoning_content
+                        )
                     else:
                         if is_in_reasnoning:
                             is_in_reasnoning = False
                             yield 'data: {"choices":[{"delta":{"content":" </think>"}}]}\n\n'
+
                 yield "data: " + chunk.model_dump_json() + "\n\n"
+
         except OpenAIError as e:
             err_msg = str(e.body) if getattr(e, "body", None) else str(e)
             err_msg = err_msg.replace('"', "'").replace("\n", " ")
-            yield 'data: {"choices":[{"delta":{"content":"⚠️ Proxy error: ' + err_msg + '"}}]}\n\n'
+            yield (
+                'data: {"choices":[{"delta":{"content":"'
+                + "⚠️ Proxy error: "
+                + err_msg
+                + '"}}]}\n\n'
+            )
+
         except Exception as e:
             err_msg = str(e).replace('"', "'").replace("\n", " ")
-            yield 'data: {"choices":[{"delta":{"content":"⚠️ Proxy error: ' + err_msg + '"}}]}\n\n'
+            yield (
+                'data: {"choices":[{"delta":{"content":"'
+                + "⚠️ Proxy error: "
+                + err_msg
+                + '"}}]}\n\n'
+            )
+
         finally:
             yield "data: [DONE]\n\n"
 
-    data = await request.json()
+    try:
+        data = await request.json()
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid or empty JSON request body"
+        )
 
     if Authorization is None:
         headers = {
             "Access-Control-Allow-Origin": "https://janitorai.com",
             "Access-Control-Allow-Credentials": "true"
         }
-        raise HTTPException(status_code=401, detail="Missing Authorization header", headers=headers)
+        raise HTTPException(
+            status_code=401,
+            detail="Missing Authorization header",
+            headers=headers
+        )
 
     key = Authorization.replace("Bearer ", "")
 
     headers = {
         "Access-Control-Allow-Origin": "https://janitorai.com",
-        "Access-Control-Allow-Credentials": "true"
+        "Access-Control-Allow-Credentials": "true",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no"
     }
 
     try:
-        first_chunk, completion = openai_stream_caller(data, url, key)
+        first_chunk, completion = await openai_stream_caller(
+            data,
+            url,
+            key
+        )
     except HTTPException as e:
         e.headers = headers
         raise e
     else:
-        return StreamingResponse(completion_generator(first_chunk, completion), media_type="text/event-stream", headers=headers)
+        return StreamingResponse(
+            completion_generator(first_chunk, completion),
+            media_type="text/event-stream",
+            headers=headers
+        )
 
 @app.options("/proxy/blank")
 async def blank_preflight_handler():
     return Response(
-        headers = {
-        "Access-Control-Allow-Origin": "https://janitorai.com",
-        "Access-Control-Allow-Methods": "POST, OPTIONS",
-        "Access-Control-Allow-Headers": "Authorization, Content-Type",
-        "Access-Control-Allow-Credentials": "true",
-        "Access-Control-Max-Age": "600"
+        headers={
+            "Access-Control-Allow-Origin": "https://janitorai.com",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Authorization, Content-Type",
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Max-Age": "600"
         }
     )
 
 @app.post("/proxy/blank")
 async def returnBlank(request: Request, text: str = "placeholder"):
     def streaming_generator():
-        yield 'data: {"choices":[{"delta":{"content":"' + text + '"}}]}\n\n'
+        safe_text = (
+            str(text)
+            .replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("\r", " ")
+            .replace("\n", " ")
+        )
+
+        yield (
+            'data: {"choices":[{"delta":{"content":"'
+            + safe_text
+            + '"}}]}\n\n'
+        )
+
+        yield "data: [DONE]\n\n"
 
     return StreamingResponse(
-        content = streaming_generator(),
-        media_type = "text/event-stream", 
-        headers = {
+        content=streaming_generator(),
+        media_type="text/event-stream",
+        headers={
             "Access-Control-Allow-Origin": "https://janitorai.com",
             "Access-Control-Allow-Credentials": "true"
         }
