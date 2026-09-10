@@ -45,6 +45,15 @@ async def callApi(
     reasoning_visibility: str = "",
     Authorization: str = Header(None)
 ):
+    def normalize_base_url(raw_url: str) -> str:
+        trimmed = raw_url.rstrip("/")
+        suffix = "/chat/completions"
+        if trimmed.endswith(suffix):
+            trimmed = trimmed[: -len(suffix)]
+        return trimmed.rstrip("/")
+
+    url = normalize_base_url(url)
+
     def extra_body():
         if reasoning == "true":
             return {"chat_template_kwargs": {"thinking": True}}
