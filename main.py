@@ -132,6 +132,7 @@ async def callApi(
             try:
                 request_data = dict(data)
                 request_data["stream"] = True
+                request_data["top_p"] = 0.95
 
                 existing_extra_body = request_data.pop("extra_body", {}) or {}
                 existing_extra_body.update(extra_body())
