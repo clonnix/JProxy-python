@@ -41,8 +41,8 @@ async def preflight_handler():
 async def callApi(
     request: Request,
     url: str,
-    reasoning: str = "",
-    reasoning_visibility: str = "",
+    reasoning: str = "true",
+    reasoning_visibility: str = "true",
     Authorization: str = Header(None)
 ):
     def normalize_base_url(raw_url: str) -> str:
