@@ -42,7 +42,7 @@ async def callApi(
     request: Request,
     url: str,
     reasoning: str = "true",
-    reasoning_visibility: str = "true",
+    reasoning_visibility: str = "",
     Authorization: str = Header(None)
 ):
     def normalize_base_url(raw_url: str) -> str:
