@@ -3,11 +3,46 @@ from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone
 import random
 
-from openai import OpenAI, OpenAIError
+import httpx
+from openai import AsyncOpenAI, OpenAIError
 from fastapi import FastAPI, Request, Response, Header, HTTPException
 from fastapi.responses import StreamingResponse, HTMLResponse, RedirectResponse
 
 app = FastAPI()
+
+# One shared connection pool for every request. Building a new client per
+# request costs CPU (SSL setup) and opens fresh connections every time,
+# which is what made the proxy slow down under many parallel requests.
+# No connection cap, so any number of requests can stream at once.
+http_client = httpx.AsyncClient(
+    limits=httpx.Limits(
+        max_connections=None,
+        max_keepalive_connections=100,
+        keepalive_expiry=60,
+    ),
+    timeout=httpx.Timeout(connect=15.0, read=600.0, write=60.0, pool=None),
+)
+
+_clients: dict = {}
+
+def get_client(base_url: str, key: str) -> AsyncOpenAI:
+    cache_key = (base_url, key)
+    client = _clients.get(cache_key)
+    if client is None:
+        if len(_clients) > 256:
+            _clients.clear()
+        client = AsyncOpenAI(
+            base_url=base_url,
+            api_key=key,
+            max_retries=0,
+            http_client=http_client,
+        )
+        _clients[cache_key] = client
+    return client
+
+@app.on_event("shutdown")
+async def close_http_client():
+    await http_client.aclose()
 
 @app.get("/")
 async def root():
@@ -129,11 +164,9 @@ async def callApi(
     ):
         last_err = None
 
-        client = OpenAI(
-            base_url=url,
-            api_key=key,
-            max_retries=0
-        )
+        # Async client on the shared pool: awaiting it yields the event
+        # loop, so other requests keep being served while this one waits.
+        client = get_client(url, key)
 
         for attempt in range(max_retries):
             completion = None
@@ -146,15 +179,15 @@ async def callApi(
                 existing_extra_body = request_data.pop("extra_body", {}) or {}
                 existing_extra_body.update(extra_body())
 
-                completion = client.chat.completions.create(
+                completion = await client.chat.completions.create(
                     **request_data,
                     extra_body=existing_extra_body,
                 )
 
-                first_chunk = next(completion)
+                first_chunk = await completion.__anext__()
                 return first_chunk, completion
 
-            except StopIteration:
+            except StopAsyncIteration:
                 return None, completion
 
             except OpenAIError as e:
@@ -219,20 +252,17 @@ async def callApi(
             )
         )
 
-    def completion_generator(first_chunk, completion):
+    async def completion_generator(first_chunk, completion):
         is_in_reasnoning = False
 
-        try:
-            chunks = completion
-
+        async def chain():
             if first_chunk is not None:
-                def chain():
-                    yield first_chunk
-                    yield from completion
+                yield first_chunk
+            async for c in completion:
+                yield c
 
-                chunks = chain()
-
-            for chunk in chunks:
+        try:
+            async for chunk in chain():
                 if not chunk.choices:
                     continue
 
@@ -308,8 +338,19 @@ async def callApi(
                 + '"}}]}\n\n'
             )
 
-        finally:
+        else:
             yield "data: [DONE]\n\n"
+            return
+
+        finally:
+            # Release the upstream connection, also when the client
+            # disconnects mid-stream.
+            try:
+                await completion.close()
+            except Exception:
+                pass
+
+        yield "data: [DONE]\n\n"
 
     try:
         data = await request.json()
