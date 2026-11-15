@@ -3,11 +3,46 @@ from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone
 import random
 
+import httpx
 from openai import AsyncOpenAI, OpenAIError
 from fastapi import FastAPI, Request, Response, Header, HTTPException
 from fastapi.responses import StreamingResponse, HTMLResponse, RedirectResponse
 
 app = FastAPI()
+
+# One shared connection pool for every request. Building a new client per
+# request costs CPU (SSL setup) and opens fresh connections every time,
+# which is what made the proxy slow down under many parallel requests.
+# No connection cap, so any number of requests can stream at once.
+http_client = httpx.AsyncClient(
+    limits=httpx.Limits(
+        max_connections=None,
+        max_keepalive_connections=100,
+        keepalive_expiry=60,
+    ),
+    timeout=httpx.Timeout(connect=15.0, read=600.0, write=60.0, pool=None),
+)
+
+_clients: dict = {}
+
+def get_client(base_url: str, key: str) -> AsyncOpenAI:
+    cache_key = (base_url, key)
+    client = _clients.get(cache_key)
+    if client is None:
+        if len(_clients) > 256:
+            _clients.clear()
+        client = AsyncOpenAI(
+            base_url=base_url,
+            api_key=key,
+            max_retries=0,
+            http_client=http_client,
+        )
+        _clients[cache_key] = client
+    return client
+
+@app.on_event("shutdown")
+async def close_http_client():
+    await http_client.aclose()
 
 @app.get("/")
 async def root():
@@ -129,13 +164,9 @@ async def callApi(
     ):
         last_err = None
 
-        # Async client: awaiting it yields the event loop, so other
-        # requests keep being served while this one waits on upstream.
-        client = AsyncOpenAI(
-            base_url=url,
-            api_key=key,
-            max_retries=0
-        )
+        # Async client on the shared pool: awaiting it yields the event
+        # loop, so other requests keep being served while this one waits.
+        client = get_client(url, key)
 
         for attempt in range(max_retries):
             completion = None
